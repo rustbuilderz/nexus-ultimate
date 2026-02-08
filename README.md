@@ -9,14 +9,14 @@
 
 ## Work items
 
-- :white_circle: **Updater**  
+- :white_circle: **Updater** (`update.cpp` / `update.h`)  
   _Not started_
 
-- :white_circle: **Downloader** (`update.cpp` / `update.h`)  
-  _Not started_
-
-- :yellow_circle: **DPI Adjusting** (`mov_math.h`)  
+- :yellow_circle: **Downloader**
   _In progress_
+
+- :white_circle: **DPI Adjusting** (`mov_math.h`)  
+  _Not started_
 
 - :white_check_mark: **Discord**  
   _Complete_
