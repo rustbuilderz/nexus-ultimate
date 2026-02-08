@@ -13,9 +13,9 @@
   _Not started_
 
 - :white_circle: **Downloader** (`update.cpp` / `update.h`)  
-  _Not started_
+  _In progress_
 
-- :white_circle: **DPI Adjusting** (`mov_math.h`)  
+- :yellow_circle: **DPI Adjusting** (`mov_math.h`)  
   _Not started_
 
 - :white_check_mark: **Discord**  
