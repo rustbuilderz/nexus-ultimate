@@ -2,7 +2,7 @@
 
 ## Status legend
 - :white_check_mark: Complete  
-- :yellow_circle: In progress  
+- :yellow_circle: In progress   
 - :white_circle: Not started  
 
 ---
