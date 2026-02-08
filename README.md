@@ -11,7 +11,7 @@
 
 - :white_circle: **Updater** (`update.cpp` / `update.h`)  
   _Not started_
-
+ 
 - :yellow_circle: **Downloader**
   _In progress_
 
