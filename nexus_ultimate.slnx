@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="nexus_ultimate.vcxproj" Id="6d1d6db3-fad3-48a7-9b49-a21b7db1bae1" />
+</Solution>
