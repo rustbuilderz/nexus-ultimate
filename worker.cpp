@@ -1,7 +1,6 @@
 #include "pch.h"
 #include "worker.h"
 
-#include "config.h"
 #include "globals.h"
 #include "json_parsing/loadops.h"
 
@@ -12,172 +11,118 @@
 
 namespace {
 
-    HANDLE OpenAndConfigureSerial() {
-        HANDLE hSerial = CreateFileW(Config::kComPort, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (hSerial == INVALID_HANDLE_VALUE) {
-            const DWORD e = GetLastError();
-            const std::wstring m = Console::Win32ErrorMessageW(e);
-            LOGW("Serial: open failed on %ls (err=%lu: %ls)", Config::kComPort, (unsigned long)e, m.c_str());
-            return INVALID_HANDLE_VALUE;
-        }
+void MoveMouseWindows(int dx, int dy) {
+    LOGI("SENDINPUT MOVE | dx=%d dy=%d", dx, dy);
 
-        DCB dcb{};
-        dcb.DCBlength = sizeof(dcb);
+    INPUT in{};
+    in.type = INPUT_MOUSE;
+    in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
+    in.mi.dx = dx;
+    in.mi.dy = dy;
+    SendInput(1, &in, sizeof(in));
+}
 
-        WIN_CHECK_RET(GetCommState(hSerial, &dcb), INVALID_HANDLE_VALUE);
+struct MouseAccum {
+    double remX = 0.0;
+    double remY = 0.0;
 
-        dcb.BaudRate = 9600;
-        dcb.ByteSize = 8;
-        dcb.Parity = NOPARITY;
-        dcb.StopBits = ONESTOPBIT;
+    bool Step(double fx, double fy, int& outDx, int& outDy) {
+        remX += fx;
+        remY += fy;
 
-        WIN_CHECK_RET(SetCommState(hSerial, &dcb), INVALID_HANDLE_VALUE);
+        const int dx = (int)std::trunc(remX);
+        const int dy = (int)std::trunc(remY);
 
-        LOGI("Serial: connected to %ls @ 9600 8N1", Config::kComPort);
-        return hSerial;
+        LOGI("ACCUM | fx=%.6f fy=%.6f remX=%.6f remY=%.6f dx=%d dy=%d",
+            fx, fy, remX, remY, dx, dy);
+
+        if (dx) remX -= dx;
+        if (dy) remY -= dy;
+
+        outDx = dx;
+        outDy = dy;
+        return dx != 0 || dy != 0;
     }
+};
 
-    bool SendMoveArduino(HANDLE hSerial, double s, char dir, double step) {
-        std::string s1 = "S" + std::to_string(s) + "\n";
+inline bool IsPressed(int vk) {
+    return vk != 0 && (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
 
-        std::string s2;
-        s2.push_back(dir);
-        s2 += std::to_string(step);
-        s2 += "\n";
+inline bool WasPressed(int vk) {
+    return vk != 0 && (GetAsyncKeyState(vk) & 1) != 0;
+}
 
-        DWORD written = 0;
-        if (!WriteFile(hSerial, s1.c_str(), (DWORD)s1.size(), &written, nullptr)) return false;
-        if (!WriteFile(hSerial, s2.c_str(), (DWORD)s2.size(), &written, nullptr)) return false;
-        return true;
+void ApplyMoveGlobals(double s_json, char dir, double step_json, int delay) {
+    if (delay < 1) delay = 1;
+    if (delay > 50) delay = 50;
+
+    g_downForce = (int)MoveMath::ForceJsonToUi((float)s_json);
+    g_delayMs = delay;
+
+    const int step_ui = (int)MoveMath::ForceJsonToUi((float)step_json);
+
+    LOGI("APPLY MOVE | s=%.6f dir=%c step=%d delay=%d downForce=%f",
+        s_json, dir, step_ui, delay, (double)g_downForce);
+
+    if (dir == 'W') {
+        g_leftDrift = step_ui;
+        g_rightDrift = 0;
     }
-
-    void MoveMouseWindows(int dx, int dy) {
-        INPUT in{};
-        in.type = INPUT_MOUSE;
-        in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
-        in.mi.dx = dx;
-        in.mi.dy = dy;
-        SendInput(1, &in, sizeof(in));
+    else {
+        g_rightDrift = step_ui;
+        g_leftDrift = 0;
     }
+}
 
-    struct MouseAccum {
-        double remX = 0.0;
-        double remY = 0.0;
-
-        bool Step(double fx, double fy, int& outDx, int& outDy) {
-            remX += fx;
-            remY += fy;
-
-            const int dx = (int)std::trunc(remX);
-            const int dy = (int)std::trunc(remY);
-
-            if (dx) remX -= dx;
-            if (dy) remY -= dy;
-
-            outDx = dx;
-            outDy = dy;
-            return dx != 0 || dy != 0;
-        }
-    };
-
-    inline bool IsPressed(int vk) {
-        return vk != 0 && (GetAsyncKeyState(vk) & 0x8000) != 0;
-    }
-
-    inline bool WasPressed(int vk) {
-        return vk != 0 && (GetAsyncKeyState(vk) & 1) != 0;
-    }
-
-    void ApplyMoveGlobals(double s_json, char dir, double step_json, int delay) {
-        if (delay < 1) delay = 1;
-        if (delay > 50) delay = 50;
-
-        g_downForce = MoveMath::ForceJsonToUi((float)s_json);
-        g_delayMs = delay;
-
-        const float step_ui = MoveMath::ForceJsonToUi((float)step_json);
-
-        if (dir == 'W') {
-            g_leftDrift = step_ui;
-            g_rightDrift = 0.0f;
-        }
-        else {
-            g_rightDrift = step_ui;
-            g_leftDrift = 0.0f;
-        }
-    }
-
-    void ReloadOpsAndTextures() {
-        LOGI("ReloadOpsAndTextures(): not implemented (stub)");
-    }
-
-} // namespace
+}
 
 void WorkerThread() {
     try {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
-        HANDLE hSerial = INVALID_HANDLE_VALUE;
         MouseAccum acc{};
 
-        MoveBackend lastBackend = MoveBackend::WindowsSendInput;
         std::string lastOp;
         bool haveMoveConfig = false;
 
+        uint64_t n = 0;
+
         while (g_running) {
+            auto loopStart = std::chrono::steady_clock::now();
+
+            if ((++n % 200) == 0) {
+                LOGI("WORKER HEARTBEAT | run=%d script=%d hold=%d op='%s' cfg=%d remX=%.3f remY=%.3f",
+                    (int)g_running, (int)g_scriptEnabled, (int)g_holding,
+                    lastOp.c_str(), (int)haveMoveConfig,
+                    acc.remX, acc.remY);
+            }
+
             if (WasPressed(g_bindQuitVK)) {
-                LOGI("Quit pressed (vk=%d) -> stopping", g_bindQuitVK);
+                LOGI("QUIT VK=%d", g_bindQuitVK);
                 g_running = false;
                 break;
             }
 
             if (WasPressed(g_bindToggleConsoleVK)) {
-                LOGI("Toggle console pressed (vk=%d)", g_bindToggleConsoleVK);
+                LOGI("CONSOLE TOGGLE VK=%d", g_bindToggleConsoleVK);
                 Console::ToggleConsole();
-            }
-
-            if (WasPressed(g_bindReloadVK)) {
-                LOGI("Reload pressed (vk=%d)", g_bindReloadVK);
-                ReloadOpsAndTextures();
             }
 
             if (WasPressed(g_bindToggleScriptVK)) {
                 g_scriptEnabled = !g_scriptEnabled;
-                LOGI("Script toggled (vk=%d) -> %s",
-                    g_bindToggleScriptVK, g_scriptEnabled ? "ON" : "OFF");
+                LOGI("SCRIPT TOGGLE -> %s", g_scriptEnabled ? "ON" : "OFF");
             }
 
-            const MoveBackend backend = g_moveBackend.load(std::memory_order_relaxed);
-            if (backend != lastBackend) {
-                acc = MouseAccum{};
-                LOGI("Backend switch: %s -> %s (accumulator reset)",
-                    lastBackend == MoveBackend::ArduinoSerial ? "ArduinoSerial" : "WindowsSendInput",
-                    backend == MoveBackend::ArduinoSerial ? "ArduinoSerial" : "WindowsSendInput");
-                lastBackend = backend;
-            }
-
-            if (backend == MoveBackend::ArduinoSerial) {
-                if (hSerial == INVALID_HANDLE_VALUE) {
-                    hSerial = OpenAndConfigureSerial();
-                    if (hSerial == INVALID_HANDLE_VALUE) {
-                        std::this_thread::sleep_for(std::chrono::seconds(1));
-                        continue;
-                    }
-                    std::this_thread::sleep_for(std::chrono::seconds(2));
-                }
-            }
-            else {
-                if (hSerial != INVALID_HANDLE_VALUE) {
-                    CloseHandle(hSerial);
-                    hSerial = INVALID_HANDLE_VALUE;
-                    LOGI("Serial: closed (Windows backend active)");
-                }
+            if (WasPressed(g_bindReloadVK)) {
+                LOGI("RELOAD KEYBINDS VK=%d", g_bindReloadVK);
+                LoadKeybindsFromJson(nullptr);
             }
 
             bool holdMouseOK = true;
             if (g_requireBothMouseButtons) {
-                const int vk1 = (g_bindHoldMouse1VK != 0) ? g_bindHoldMouse1VK : VK_LBUTTON;
-                const int vk2 = (g_bindHoldMouse2VK != 0) ? g_bindHoldMouse2VK : VK_RBUTTON;
+                const int vk1 = g_bindHoldMouse1VK ? g_bindHoldMouse1VK : VK_LBUTTON;
+                const int vk2 = g_bindHoldMouse2VK ? g_bindHoldMouse2VK : VK_RBUTTON;
                 holdMouseOK = IsPressed(vk1) && IsPressed(vk2);
             }
 
@@ -185,7 +130,7 @@ void WorkerThread() {
             if (g_bindHoldModifierVK != 0)
                 holdModOK = IsPressed(g_bindHoldModifierVK);
 
-            g_holding = (holdMouseOK && holdModOK);
+            g_holding = holdMouseOK && holdModOK;
 
             std::string op;
             {
@@ -193,78 +138,83 @@ void WorkerThread() {
                 op = g_selectedOpName;
             }
 
+            if (g_reloadMoveFromOps.exchange(false)) {
+                if (!op.empty()) {
+                    double s = 0, step = 0;
+                    char dir = 0;
+                    int delay = 10;
+
+                    if (GetMoveForOperator(op, s, dir, step, delay)) {
+                        ApplyMoveGlobals(s, dir, step, delay);
+                        haveMoveConfig = true;
+                        LOGI("OPS.JSON RELOAD | op='%s' s=%.6f step=%.6f dir=%c delay=%d",
+                            op.c_str(), s, step, dir, delay);
+                    }
+                    else {
+                        haveMoveConfig = false;
+                        LOGW("OPS.JSON RELOAD FAILED | op='%s'", op.c_str());
+                    }
+                }
+            }
+
             if (op != lastOp) {
                 lastOp = op;
                 haveMoveConfig = false;
 
                 if (op.empty()) {
-                    LOGI("Operator cleared -> movement disabled");
+                    LOGI("OP CLEARED");
                 }
                 else {
-                    double s = 0.0;
-                    double step = 0.0;
+                    double s = 0, step = 0;
                     char dir = 0;
                     int delay = 10;
 
-                    if (!GetMoveForOperator(op, s, dir, step, delay)) {
-                        LOGW("GetMoveForOperator failed for op='%s' -> movement disabled", op.c_str());
-                    }
-                    else {
+                    if (GetMoveForOperator(op, s, dir, step, delay)) {
                         ApplyMoveGlobals(s, dir, step, delay);
                         haveMoveConfig = true;
 
-                        LOGI("Operator changed -> '%s' down=%.6f right=%.6f left=%.6f delay=%d",
-                            op.c_str(),
-                            (double)g_downForce,
-                            (double)g_rightDrift,
-                            (double)g_leftDrift,
-                            g_delayMs);
+                        LOGI("OP LOADED '%s' s=%.6f step=%.6f dir=%c delay=%d",
+                            op.c_str(), s, step, dir, delay);
+                    }
+                    else {
+                        LOGW("OP LOAD FAILED '%s'", op.c_str());
                     }
                 }
             }
 
             int sleepMs = haveMoveConfig ? g_delayMs : 10;
-            if (sleepMs < 1) sleepMs = 1;
-            if (sleepMs > 50) sleepMs = 50;
+            sleepMs = std::clamp(sleepMs, 1, 50);
 
             if (g_holding && g_scriptEnabled && haveMoveConfig && !op.empty()) {
-                if (backend == MoveBackend::ArduinoSerial) {
-                    const double s = (double)g_downForce;
-                    const char dir = (g_leftDrift > 0.0f) ? 'W' : 'E';
-                    const double step = (g_leftDrift > 0.0f) ? (double)g_leftDrift : (double)g_rightDrift;
+                const double fx = ((g_rightDrift - g_leftDrift)
+                    / ((double)g_moveDiv * 5.0));
 
-                    if (!SendMoveArduino(hSerial, s, dir, step)) {
-                        LOGW("Serial: write failed -> dropping connection");
-                        CloseHandle(hSerial);
-                        hSerial = INVALID_HANDLE_VALUE;
-                    }
-                }
-                else {
-                    const double fx = (double)g_rightDrift - (double)g_leftDrift;
-                    const double fy = (double)g_downForce;
+                const double fy = ((double)g_downForce) / (double)g_moveDiv;
 
-                    int dx = 0, dy = 0;
-                    const bool willMove = acc.Step(fx, fy, dx, dy);
+                int dx = 0, dy = 0;
+                const bool moved = acc.Step(fx, fy, dx, dy);
 
-                    LOGI("WinMove: op='%s' fx=%.6f fy=%.6f -> dx=%d dy=%d | remX=%.6f remY=%.6f | delay=%d",
-                        op.c_str(), fx, fy, dx, dy, acc.remX, acc.remY, sleepMs);
+                LOGI("WIN MOVE | op='%s' fx=%.6f fy=%.6f dx=%d dy=%d remX=%.6f remY=%.6f",
+                    op.c_str(), fx, fy, dx, dy, acc.remX, acc.remY);
 
-                    if (willMove) MoveMouseWindows(dx, dy);
-                }
+                if (moved) MoveMouseWindows(dx, dy);
             }
+
+            auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - loopStart).count();
+
+            if (dur > 20)
+                LOGW("LOOP SPIKE %lld ms", dur);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
         }
 
-        if (hSerial != INVALID_HANDLE_VALUE)
-            CloseHandle(hSerial);
-
-        LOGI("Worker thread exiting.");
+        LOGI("WORKER EXIT");
     }
     catch (const std::exception& e) {
-        LOGF("Worker thread exception: %s", e.what());
+        LOGF("WORKER EXCEPTION %s", e.what());
     }
     catch (...) {
-        LOGF("Worker thread exception: unknown");
+        LOGF("WORKER EXCEPTION UNKNOWN");
     }
 }

@@ -3,5 +3,6 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
+  <Project Path="../panel_drawing/panel_drawing.vcxproj" Id="d5e365e5-adae-4b30-89db-31c96f34a0e3" />
   <Project Path="nexus_ultimate.vcxproj" Id="6d1d6db3-fad3-48a7-9b49-a21b7db1bae1" />
 </Solution>

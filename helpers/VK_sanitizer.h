@@ -1,95 +1,129 @@
 #pragma once
 
 #include "pch.h"
-
+#include "imgui/imgui.h"
 namespace Input {
 
-    inline const char* VkToName(int vk) {
-        switch (vk) {
-        case 0:            return "(none)";
-        case VK_LBUTTON:   return "Mouse1 (LMB)";
-        case VK_RBUTTON:   return "Mouse2 (RMB)";
-        case VK_MBUTTON:   return "Mouse3 (MMB)";
-        case VK_XBUTTON1:  return "Mouse4";
-        case VK_XBUTTON2:  return "Mouse5";
-        case VK_BACK:      return "Backspace";
-        case VK_TAB:       return "Tab";
-        case VK_RETURN:    return "Enter";
-        case VK_SHIFT:     return "Shift";
-        case VK_CONTROL:   return "Ctrl";
-        case VK_MENU:      return "Alt";
-        case VK_PAUSE:     return "Pause";
-        case VK_CAPITAL:   return "CapsLock";
-        case VK_ESCAPE:    return "Esc";
-        case VK_SPACE:     return "Space";
-        case VK_PRIOR:     return "PageUp";
-        case VK_NEXT:      return "PageDown";
-        case VK_END:       return "End";
-        case VK_HOME:      return "Home";
-        case VK_LEFT:      return "Left";
-        case VK_UP:        return "Up";
-        case VK_RIGHT:     return "Right";
-        case VK_DOWN:      return "Down";
-        case VK_INSERT:    return "Insert";
-        case VK_DELETE:    return "Delete";
-        case VK_F1:        return "F1";
-        case VK_F2:        return "F2";
-        case VK_F3:        return "F3";
-        case VK_F4:        return "F4";
-        case VK_F5:        return "F5";
-        case VK_F6:        return "F6";
-        case VK_F7:        return "F7";
-        case VK_F8:        return "F8";
-        case VK_F9:        return "F9";
-        case VK_F10:       return "F10";
-        case VK_F11:       return "F11";
-        case VK_F12:       return "F12";
-        default: break;
+    static const char* VkToNameViaMapVirtualKeyA(int vk, char* out, size_t outSz)
+    {
+        if (!out || outSz == 0) return "";
+
+        if (vk <= 0)
+        {
+            strcpy_s(out, outSz, "None");
+            return out;
         }
 
-        if (vk >= 'A' && vk <= 'Z') {
-            static thread_local char s[2]{};
-            s[0] = static_cast<char>(vk);
-            s[1] = '\0';
-            return s;
+        UINT scan = MapVirtualKeyA((UINT)vk, MAPVK_VK_TO_VSC);
+
+        switch (vk)
+        {
+        case VK_LEFT: case VK_UP: case VK_RIGHT: case VK_DOWN:
+        case VK_PRIOR: case VK_NEXT:
+        case VK_END: case VK_HOME:
+        case VK_INSERT: case VK_DELETE:
+        case VK_DIVIDE: case VK_NUMLOCK:
+            scan |= 0xE000;
+            break;
+        default:
+            break;
         }
 
-        if (vk >= '0' && vk <= '9') {
-            static thread_local char s[2]{};
-            s[0] = static_cast<char>(vk);
-            s[1] = '\0';
-            return s;
-        }
+        LONG lParam = (LONG)(scan << 16);
+        int len = GetKeyNameTextA(lParam, out, (int)outSz);
+        if (len <= 0)
+            strcpy_s(out, outSz, "Unknown");
 
-        return "(vk)";
+        return out;
+    }
+    inline void SnapshotKeyAsyncState(SHORT* outPrev256)
+    {
+        for (int i = 1; i <= 254; ++i)
+            outPrev256[i] = GetAsyncKeyState(i);
+        outPrev256[0] = 0;
+        outPrev256[255] = 0;
     }
 
-    inline bool CaptureVkOnce(int& outVk, bool allowMouseButtons = true) {
-        auto pressedThisFrame = [](int vk) -> bool {
-            return (GetAsyncKeyState(vk) & 1) != 0;
-            };
+    static void KeybindWidget(
+        const char* label,
+        int* bindVK,
+        float buttonWidth = 160.0f,
+        float buttonHeight = 0.0f
+    )
+    {
+        if (!bindVK) return;
 
-        if (allowMouseButtons) {
-            if (pressedThisFrame(VK_LBUTTON)) { outVk = VK_LBUTTON;  return true; }
-            if (pressedThisFrame(VK_RBUTTON)) { outVk = VK_RBUTTON;  return true; }
-            if (pressedThisFrame(VK_MBUTTON)) { outVk = VK_MBUTTON;  return true; }
-            if (pressedThisFrame(VK_XBUTTON1)) { outVk = VK_XBUTTON1; return true; }
-            if (pressedThisFrame(VK_XBUTTON2)) { outVk = VK_XBUTTON2; return true; }
-        }
+        static int* s_captureTarget = nullptr;
+        static SHORT s_prev[256] = {};
 
-        for (int vk = 8; vk <= 0xFE; ++vk) {
-            if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON ||
-                vk == VK_XBUTTON1 || vk == VK_XBUTTON2) {
-                continue;
-            }
+        ImGui::PushID(bindVK);
 
-            if (pressedThisFrame(vk)) {
-                outVk = vk;
-                return true;
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine();
+
+        char nameBuf[64]{};
+        VkToNameViaMapVirtualKeyA(*bindVK, nameBuf, sizeof(nameBuf));
+
+        char btnText[96]{};
+        if (s_captureTarget == bindVK)
+            strcpy_s(btnText, "Press a key...");
+        else
+            sprintf_s(btnText, "%s", nameBuf);
+
+        if (ImGui::Button(btnText, ImVec2(buttonWidth, buttonHeight)))
+        {
+            if (s_captureTarget == bindVK)
+                s_captureTarget = nullptr;
+            else
+            {
+                s_captureTarget = bindVK;
+                SnapshotKeyAsyncState(s_prev);
             }
         }
 
-        return false;
+        if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+        {
+            *bindVK = 0;
+            if (s_captureTarget == bindVK) s_captureTarget = nullptr;
+            if (!SaveKeybindsToJson(nullptr))
+                LOGW("SaveKeybindsToJson failed");
+        }
+
+        if (s_captureTarget == bindVK)
+        {
+            for (int vk = 1; vk <= 254; ++vk)
+            {
+                if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON)
+                    continue;
+
+                SHORT cur = GetAsyncKeyState(vk);
+                bool downNow = (cur & 0x8000) != 0;
+                bool downPrev = (s_prev[vk] & 0x8000) != 0;
+
+                if (downNow && !downPrev)
+                {
+                    if (vk == VK_ESCAPE)
+                    {
+                        s_captureTarget = nullptr;
+                        break;
+                    }
+                    *bindVK = vk;
+                    s_captureTarget = nullptr;
+                    if (!SaveKeybindsToJson(nullptr))
+                        LOGW("SaveKeybindsToJson failed");
+                    break;
+                }
+
+                s_prev[vk] = cur;
+            }
+
+            ImGui::SameLine();
+            ImGui::TextDisabled("(Esc cancel, RMB clear)");
+        }
+
+        ImGui::PopID();
     }
 
-} // namespace Input
+}
+

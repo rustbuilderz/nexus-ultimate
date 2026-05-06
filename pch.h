@@ -3,9 +3,17 @@
 #ifndef UNICODE
 #define UNICODE
 #endif
+#define GLFW_INCLUDE_NONE
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <windowsx.h>
+#include <unknwn.h>
+#include <objidl.h>
+#include <propidl.h>
+
+#include <wincodec.h>
+
 #include <gdiplus.h>
+#include <windowsx.h>
 #include <filesystem>
 #include <vector>
 #include <string>
@@ -21,14 +29,11 @@
 #include <iomanip>
 #include <ctime>
 #include <cstdarg>
-#include <filesystem>
 #include <nlohmann/json.hpp>
 #include <string_view>
 #include <cmath>
-#include <algorithm>
 #include <dwmapi.h>
 
-#include "rendering/bitmap_handler.h"
 #include "config.h"
 #include "console_alloc.h"
 #include "globals.h"

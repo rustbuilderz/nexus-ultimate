@@ -4,187 +4,70 @@
 #include "config.h"
 #include "globals.h"
 
+using json = nlohmann::json;
+
 #include <cmath>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <system_error>
 #include <windows.h>
 
-namespace {
-    constexpr int kDelayMin = 1;
-    constexpr int kDelayMax = 50;
+static constexpr int kDelayMin = 1;
+static constexpr int kDelayMax = 50;
 
-    std::filesystem::path ExpandPath(const wchar_t* macroPath) {
-        const std::wstring expanded = Config::ExpandEnvW(macroPath);
-        return std::filesystem::path(expanded);
+std::filesystem::path ExpandPath(const wchar_t* macroPath) {
+    const std::wstring expanded = Config::ExpandEnvW(macroPath);
+    return std::filesystem::path(expanded);
+}
+
+std::filesystem::path OpsPath() {
+    return ExpandPath(Config::kOpsPath);
+}
+
+std::filesystem::path KeybindsPath() {
+    return ExpandPath(Config::kKeybindPath);
+}
+
+std::filesystem::path UiSettingsPath() {
+    return ExpandPath(Config::kUiSettingsPath);
+}
+
+std::string ReadWholeFile(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return {};
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+bool WriteFileAtomic(const std::filesystem::path& target, const std::string& bytes) {
+    std::error_code ec;
+    std::filesystem::create_directories(target.parent_path(), ec);
+
+    const auto tmp = target.parent_path() / (target.filename().wstring() + L".tmp");
+
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+
+        f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        f.flush();
+        if (!f) return false;
     }
 
-    std::string ReadFileBinary(const std::filesystem::path& p) {
-        std::ifstream f(p, std::ios::binary);
-        if (!f) return {};
-        return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-    }
+    std::filesystem::rename(tmp, target, ec);
+    if (!ec) return true;
 
-    bool WriteFileAtomic(const std::filesystem::path& target, const std::string& bytes) {
-        std::error_code ec;
-        std::filesystem::create_directories(target.parent_path(), ec);
-
-        const auto tmp = target.parent_path() / (target.filename().wstring() + L".tmp");
-
-        {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-            if (!f) return false;
-
-            f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-            f.flush();
-            if (!f) return false;
-        }
-
-        std::filesystem::rename(tmp, target, ec);
-        if (!ec) return true;
-
-        std::filesystem::remove(target, ec);
-        ec.clear();
-        std::filesystem::rename(tmp, target, ec);
-        if (ec) {
-            std::filesystem::remove(tmp, ec);
-            return false;
-        }
-
-        return true;
-    }
-
-    int ClampDelay(int d) {
-        if (d < kDelayMin) return kDelayMin;
-        if (d > kDelayMax) return kDelayMax;
-        return d;
-    }
-
-    // Shared validation: allowed keys and required fields
-    bool ValidateOpObject(const json& item, std::string* err) {
-        if (!item.is_object()) { if (err) *err = "entry is not an object"; return false; }
-
-        for (auto it = item.begin(); it != item.end(); ++it) {
-            const std::string& k = it.key();
-            if (k == "name" || k == "s" || k == "e" || k == "w" || k == "delay") continue;
-            if (err) *err = "invalid key: " + k;
-            return false;
-        }
-
-        if (!item.contains("name") || !item["name"].is_string()) {
-            if (err) *err = "missing/invalid name";
-            return false;
-        }
-
-        if (!item.contains("s") || !(item["s"].is_number_float() || item["s"].is_number_integer())) {
-            if (err) *err = "missing/invalid s";
-            return false;
-        }
-
-        if (!item.contains("delay") || !item["delay"].is_number_integer()) {
-            if (err) *err = "missing/invalid delay";
-            return false;
-        }
-
-        const int d = item["delay"].get<int>();
-        if (d < kDelayMin || d > kDelayMax) {
-            if (err) *err = "delay must be 1..50";
-            return false;
-        }
-
-        const bool hasE = item.contains("e");
-        const bool hasW = item.contains("w");
-        if (hasE == hasW) {
-            if (err) *err = "must have exactly one of e or w";
-            return false;
-        }
-
-        if (hasE && !(item["e"].is_number_float() || item["e"].is_number_integer())) {
-            if (err) *err = "invalid e";
-            return false;
-        }
-        if (hasW && !(item["w"].is_number_float() || item["w"].is_number_integer())) {
-            if (err) *err = "invalid w";
-            return false;
-        }
-
-        return true;
-    }
-
-    bool FindOperator(const json& arr, const std::string& name, const json** outItem) {
-        if (!arr.is_array()) return false;
-
-        for (const auto& item : arr) {
-            if (!item.is_object()) continue;
-
-            auto itName = item.find("name");
-            if (itName == item.end() || !itName->is_string()) continue;
-
-            if (itName->get<std::string>() == name) {
-                if (outItem) *outItem = &item;
-                return true;
-            }
-        }
-
+    std::filesystem::remove(target, ec);
+    ec.clear();
+    std::filesystem::rename(tmp, target, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
         return false;
     }
 
-    bool ExtractMoveFields(
-        const json& item,
-        double& outS,
-        char& outDir,
-        double& outStep,
-        int& outDelay,
-        std::string* outErr
-    ) {
-        std::string err;
-        if (!ValidateOpObject(item, &err)) {
-            if (outErr) *outErr = err;
-            return false;
-        }
-
-        outS = item["s"].get<double>();
-        outDelay = item["delay"].get<int>();
-
-        if (item.contains("e")) {
-            outDir = 'E';
-            outStep = item["e"].get<double>();
-        }
-        else {
-            outDir = 'W';
-            outStep = item["w"].get<double>();
-        }
-
-        if (outErr) outErr->clear();
-        return true;
-    }
-
-    bool ApplyMoveToGlobals(double s, char dir, double step, int delay) {
-        g_downForce = MoveMath::ForceJsonToUi(static_cast<float>(s));
-        g_delayMs = ClampDelay(delay);
-
-        if (dir == 'E') {
-            g_rightDrift = MoveMath::ForceJsonToUi(static_cast<float>(step));
-            g_leftDrift = 0.0f;
-        }
-        else {
-            g_leftDrift = MoveMath::ForceJsonToUi(static_cast<float>(step));
-            g_rightDrift = 0.0f;
-        }
-
-        return true;
-    }
-
-    std::filesystem::path OpsPath() {
-        return ExpandPath(Config::kOpsPath);
-    }
-
-    std::filesystem::path KeybindsPath() {
-        return ExpandPath(Config::kKeybindPath);
-    }
-
-} // namespace
+    return true;
+}
 
 bool LoadOpsJson(json& out) {
     const auto p = OpsPath();
@@ -223,142 +106,101 @@ bool SaveOpsJson(const json& j) {
     return true;
 }
 
-bool GetMoveForOperator(const std::string& name, double& outS, char& outDir, double& outStep, int& outDelay) {
-    json j;
-    if (!LoadOpsJson(j)) return false;
+bool ValidateOpObject(const json& item, std::string* err) {
+    if (!item.is_object()) { if (err) *err = "entry is not an object"; return false; }
 
-    const json* item = nullptr;
-    if (!FindOperator(j, name, &item) || !item) return false;
+    for (auto it = item.begin(); it != item.end(); ++it) {
+        const std::string& k = it.key();
+        if (k == "name" || k == "s" || k == "e" || k == "w" || k == "delay") continue;
+        if (err) *err = "invalid key: " + k;
+        return false;
+    }
 
-    std::string err;
-    if (!ExtractMoveFields(*item, outS, outDir, outStep, outDelay, &err)) {
-        LOGW("GetMoveForOperator: invalid entry for '%s': %s", name.c_str(), err.c_str());
+    if (!item.contains("name") || !item["name"].is_string()) {
+        if (err) *err = "missing/invalid name";
+        return false;
+    }
+
+    if (!item.contains("s") || !(item["s"].is_number_float() || item["s"].is_number_integer())) {
+        if (err) *err = "missing/invalid s";
+        return false;
+    }
+
+    if (!item.contains("delay") || !item["delay"].is_number_integer()) {
+        if (err) *err = "missing/invalid delay";
+        return false;
+    }
+
+    const int d = item["delay"].get<int>();
+    if (d < kDelayMin || d > kDelayMax) {
+        if (err) *err = "delay must be 1..50";
+        return false;
+    }
+
+    const bool hasE = item.contains("e");
+    const bool hasW = item.contains("w");
+    if (hasE == hasW) {
+        if (err) *err = "must have exactly one of e or w";
+        return false;
+    }
+
+    if (hasE && !(item["e"].is_number_float() || item["e"].is_number_integer())) {
+        if (err) *err = "invalid e";
+        return false;
+    }
+    if (hasW && !(item["w"].is_number_float() || item["w"].is_number_integer())) {
+        if (err) *err = "invalid w";
         return false;
     }
 
     return true;
 }
 
-bool LoadUiForOperator(const std::string& name) {
-    json j;
-    if (!LoadOpsJson(j)) return false;
+bool FindOperator(const json& arr, const std::string& name, const json** outItem) {
+    if (!arr.is_array()) return false;
 
-    const json* item = nullptr;
-    if (!FindOperator(j, name, &item) || !item) return false;
-
-    double s = 0.0;
-    double step = 0.0;
-    int delay = 0;
-    char dir = 'E';
-
-    std::string err;
-    if (!ExtractMoveFields(*item, s, dir, step, delay, &err)) return false;
-
-    return ApplyMoveToGlobals(s, dir, step, delay);
-}
-
-bool ApplyUiFromOperatorJson(const std::string& name, std::string* outErr) {
-    if (outErr) outErr->clear();
-
-    json j;
-    if (!LoadOpsJson(j)) {
-        if (outErr) *outErr = "ops.json failed to load";
-        return false;
-    }
-    if (!j.is_array()) {
-        if (outErr) *outErr = "ops.json is not an array";
-        return false;
-    }
-
-    const json* item = nullptr;
-    if (!FindOperator(j, name, &item) || !item) {
-        if (outErr) *outErr = "operator not found in ops.json";
-        return false;
-    }
-
-    double s = 0.0;
-    double step = 0.0;
-    int delay = 0;
-    char dir = 'E';
-
-    if (!ExtractMoveFields(*item, s, dir, step, delay, outErr)) return false;
-
-    // Keep existing clamping behavior from the original ApplyUiFromOperatorJson
-    if (s < 0.0) s = 0.0;
-    if (s > 100.0) s = 100.0;
-    if (step < 0.0) step = 0.0;
-    if (step > 100.0) step = 100.0;
-
-    return ApplyMoveToGlobals(s, dir, step, delay);
-}
-
-bool SaveUiForOperator(const std::string& name, std::string* outErr) {
-    if (outErr) outErr->clear();
-
-    if (g_delayMs < kDelayMin || g_delayMs > kDelayMax) {
-        if (outErr) *outErr = "Delay must be 1..50";
-        return false;
-    }
-
-    const float down = MoveMath:: Snap1(MoveMath::ZeroEps(g_downForce));
-    const float east = MoveMath::Snap1(MoveMath::ZeroEps(g_rightDrift));
-    const float west = MoveMath::Snap1(MoveMath::ZeroEps(g_leftDrift));
-
-    const bool eNonZero = (east != 0.0f);
-    const bool wNonZero = (west != 0.0f);
-
-    if (eNonZero && wNonZero) {
-        if (outErr) *outErr = "Either East (e) or West (w) must be 0 (not both non-zero)";
-        return false;
-    }
-    if (!eNonZero && !wNonZero) {
-        if (outErr) *outErr = "Set either East (e) or West (w) to a non-zero value";
-        return false;
-    }
-
-    json j;
-    if (!LoadOpsJson(j) || !j.is_array()) j = json::array();
-
-    json* target = nullptr;
-    for (auto& item : j) {
+    for (const auto& item : arr) {
         if (!item.is_object()) continue;
 
         auto itName = item.find("name");
-        if (itName != item.end() && itName->is_string() && itName->get<std::string>() == name) {
-            target = &item;
-            break;
+        if (itName == item.end() || !itName->is_string()) continue;
+
+        if (itName->get<std::string>() == name) {
+            if (outItem) *outItem = &item;
+            return true;
         }
     }
 
-    if (!target) {
-        j.push_back(json::object());
-        target = &j.back();
-        (*target)["name"] = name;
-    }
+    return false;
+}
 
-    (*target)["s"] = static_cast<double>(MoveMath::Snap2(MoveMath::ForceUiToJson(down)));
-    (*target)["delay"] = g_delayMs;
-
-    if (eNonZero) {
-        target->erase("w");
-        (*target)["e"] = static_cast<double>(MoveMath::Snap2(MoveMath::ForceUiToJson(east)));
-    }
-    else {
-        target->erase("e");
-        (*target)["w"] = static_cast<double>(MoveMath::Snap2(MoveMath::ForceUiToJson(west)));
-    }
-
+bool ExtractMoveFields(
+    const json& item,
+    double& outS,
+    char& outDir,
+    double& outStep,
+    int& outDelay,
+    std::string* outErr
+) {
     std::string err;
-    if (!ValidateOpObject(*target, &err)) {
+    if (!ValidateOpObject(item, &err)) {
         if (outErr) *outErr = err;
         return false;
     }
 
-    if (!SaveOpsJson(j)) {
-        if (outErr) *outErr = "Failed to write ops.json";
-        return false;
+    outS = item["s"].get<double>();
+    outDelay = item["delay"].get<int>();
+
+    if (item.contains("e")) {
+        outDir = 'E';
+        outStep = item["e"].get<double>();
+    }
+    else {
+        outDir = 'W';
+        outStep = item["w"].get<double>();
     }
 
+    if (outErr) outErr->clear();
     return true;
 }
 
@@ -367,17 +209,16 @@ bool LoadKeybindsFromJson(std::string* outErr) {
 
     const auto p = KeybindsPath();
     if (p.empty()) {
-        if (outErr) *outErr = "ExpandEnvironmentStrings failed for KEYBIND_PATH";
+        if (outErr) *outErr = "ExpandEnvironmentStrings failed for keybind path";
         return false;
     }
 
-    if (!std::filesystem::exists(p)) return true;
+    if (!std::filesystem::exists(p))
+        return true;
 
-    const std::string content = ReadFileBinary(p);
-    if (content.empty()) {
-        if (outErr) *outErr = "Cannot open keybinds.json";
-        return false;
-    }
+    const std::string content = ReadWholeFile(p);
+    if (content.empty())
+        return true;
 
     json j;
     try {
@@ -400,14 +241,13 @@ bool LoadKeybindsFromJson(std::string* outErr) {
 
         auto getInt = [&](const char* key, int& dst) {
             auto it = b.find(key);
-            if (it != b.end() && it->is_number_integer()) dst = it->get<int>();
+            if (it != b.end() && it->is_number()) dst = it->get<int>();
             };
 
         getInt("toggle_script", g_bindToggleScriptVK);
         getInt("quit", g_bindQuitVK);
         getInt("toggle_console", g_bindToggleConsoleVK);
         getInt("reload", g_bindReloadVK);
-
         getInt("hold_mouse1", g_bindHoldMouse1VK);
         getInt("hold_mouse2", g_bindHoldMouse2VK);
         getInt("hold_modifier", g_bindHoldModifierVK);
@@ -438,7 +278,7 @@ bool SaveKeybindsToJson(std::string* outErr) {
 
     const auto p = KeybindsPath();
     if (p.empty()) {
-        if (outErr) *outErr = "ExpandEnvironmentStrings failed for KEYBIND_PATH";
+        if (outErr) *outErr = "ExpandEnvironmentStrings failed for keybind path";
         return false;
     }
 
@@ -459,9 +299,235 @@ bool SaveKeybindsToJson(std::string* outErr) {
 
     const std::string pretty = j.dump(2);
     if (!WriteFileAtomic(p, pretty)) {
-        if (outErr) *outErr = "Write/replace failed";
+        if (outErr) *outErr = "Write/replace keybinds.json failed";
         return false;
     }
 
+    LOGI("Saved keybinds to %s", p.u8string().c_str());
+    return true;
+}
+
+bool LoadUiSettingsFromJson(std::string* outErr) {
+    if (outErr) outErr->clear();
+
+    constexpr int kThemeSlotCount = 6;
+
+    const auto p = UiSettingsPath();
+    if (p.empty()) {
+        if (outErr) *outErr = "ExpandEnvironmentStrings failed for ui.json path";
+        return false;
+    }
+
+    if (!std::filesystem::exists(p))
+        return true;
+
+    const std::string content = ReadWholeFile(p);
+    if (content.empty())
+        return true;
+
+    json j;
+    try {
+        j = json::parse(content);
+    }
+    catch (const std::exception& e) {
+        if (outErr) *outErr = std::string("Parse failed: ") + e.what();
+        return false;
+    }
+    catch (...) {
+        if (outErr) *outErr = "Parse failed (unknown)";
+        return false;
+    }
+
+    if (!j.is_object()) return true;
+
+    auto it = j.find("theme_index");
+    if (it != j.end() && it->is_number()) {
+        int ti = it->get<int>();
+        if (ti < 0) ti = 0;
+        if (ti >= kThemeSlotCount) ti = kThemeSlotCount - 1;
+        g_themeIndex = ti;
+    }
+
+    return true;
+}
+
+bool SaveUiSettingsToJson(std::string* outErr) {
+    if (outErr) outErr->clear();
+
+    constexpr int kThemeSlotCount = 6;
+
+    const auto p = UiSettingsPath();
+    if (p.empty()) {
+        if (outErr) *outErr = "ExpandEnvironmentStrings failed for ui.json path";
+        return false;
+    }
+
+    int ti = g_themeIndex;
+    if (ti < 0) ti = 0;
+    if (ti >= kThemeSlotCount) ti = kThemeSlotCount - 1;
+
+    json j;
+    j["version"] = 1;
+    j["theme_index"] = ti;
+
+    const std::string pretty = j.dump(2);
+    if (!WriteFileAtomic(p, pretty)) {
+        if (outErr) *outErr = "Write/replace ui.json failed";
+        return false;
+    }
+
+    LOGI("Saved ui settings to %s", p.u8string().c_str());
+    return true;
+}
+
+bool GetMoveForOperator(const std::string& name, double& outS, char& outDir, double& outStep, int& outDelay) {
+    json j;
+    if (!LoadOpsJson(j)) return false;
+
+    const json* item = nullptr;
+    if (!FindOperator(j, name, &item) || !item) return false;
+
+    std::string err;
+    if (!ExtractMoveFields(*item, outS, outDir, outStep, outDelay, &err)) {
+        LOGW("GetMoveForOperator: invalid entry for '%s': %s", name.c_str(), err.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+static std::string Utf8LowerAscii(std::string s)
+{
+    for (char& c : s)
+        c = (char)std::tolower((unsigned char)c);
+    return s;
+}
+
+bool GetMoveForOperatorByBmpStem(
+    const std::string& bmpFilenameUtf8,
+    double& outS,
+    char& outDir,
+    double& outStep,
+    int& outDelay,
+    std::string* outCanonicalName
+)
+{
+    if (outCanonicalName)
+        outCanonicalName->clear();
+
+    std::string stem = bmpFilenameUtf8;
+    const size_t dot = stem.rfind('.');
+    if (dot != std::string::npos)
+        stem = stem.substr(0, dot);
+    const std::string stemLower = Utf8LowerAscii(stem);
+
+    json j;
+    if (!LoadOpsJson(j) || !j.is_array())
+        return false;
+
+    for (const auto& item : j) {
+        if (!item.is_object())
+            continue;
+        auto itName = item.find("name");
+        if (itName == item.end() || !itName->is_string())
+            continue;
+        const std::string n = itName->get<std::string>();
+        if (Utf8LowerAscii(n) != stemLower)
+            continue;
+
+        std::string err;
+        if (!ExtractMoveFields(item, outS, outDir, outStep, outDelay, &err)) {
+            LOGW("GetMoveForOperatorByBmpStem: invalid entry for '%s': %s", n.c_str(), err.c_str());
+            return false;
+        }
+        if (outCanonicalName)
+            *outCanonicalName = n;
+        return true;
+    }
+
+    return false;
+}
+
+bool SaveOperatorToOpsJson(
+    const std::string& operatorName,
+    int delayMs,
+    double southS,
+    char ewDir,
+    double ewStep,
+    std::string* outErr)
+{
+    if (outErr)
+        outErr->clear();
+
+    json j;
+    if (!LoadOpsJson(j)) {
+        if (outErr)
+            *outErr = "cannot load ops.json";
+        return false;
+    }
+
+    if (!j.is_array()) {
+        if (outErr)
+            *outErr = "ops.json must be a JSON array";
+        return false;
+    }
+
+    const char dir = (char)std::toupper((unsigned char)ewDir);
+    if (dir != 'E' && dir != 'W') {
+        if (outErr)
+            *outErr = "direction must be E or W";
+        return false;
+    }
+
+    bool found = false;
+    for (auto& item : j) {
+        if (!item.is_object())
+            continue;
+        auto itName = item.find("name");
+        if (itName == item.end() || !itName->is_string())
+            continue;
+        if (itName->get<std::string>() != operatorName)
+            continue;
+
+        item["delay"] = delayMs;
+        item["s"] = southS;
+        if (dir == 'E') {
+            item.erase("w");
+            item["e"] = ewStep;
+        }
+        else {
+            item.erase("e");
+            item["w"] = ewStep;
+        }
+
+        std::string err;
+        if (!ValidateOpObject(item, &err)) {
+            if (outErr)
+                *outErr = err;
+            return false;
+        }
+        found = true;
+        break;
+    }
+
+    if (!found) {
+        if (outErr)
+            *outErr = "operator not found: " + operatorName;
+        return false;
+    }
+
+    if (!SaveOpsJson(j)) {
+        if (outErr)
+            *outErr = "failed to write ops.json";
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_selMutex);
+        if (g_selectedOpName == operatorName)
+            g_reloadMoveFromOps.store(true, std::memory_order_relaxed);
+    }
+
+    LOGI("Saved operator '%s' to ops.json", operatorName.c_str());
     return true;
 }

@@ -1,228 +1,351 @@
+#define WIN32_LEAN_AND_MEAN
 #include "pch.h"
-
-#include "console_alloc.h"
-#include "config.h"
-#include "globals.h"
-#include "worker.h"
-
-#include "rendering/draw.h"
-#include "rendering/ui_widgets.h"
-
 #include <windows.h>
+#include "rendering/draw.h"
+#include "rendering/operator_config_window.h"
+#include "console_alloc.h"
+#include "worker.h"
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#include <pdh.h>
+#pragma comment(lib, "pdh.lib")
 
-#include "imgui/imgui.h"
-#include "imgui/backends/imgui_impl_dx11.h"
-#include "imgui/backends/imgui_impl_win32.h"
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
 
-#pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "windowscodecs.lib")
-#pragma comment(lib, "shell32.lib")
+#include <glad/glad.h>
 
-extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+#include "imgui.h"
+#include "imgui/backends/imgui_impl_glfw.h"
 
-using Draw = Render::Draw;
+#define IMGUI_IMPL_OPENGL_LOADER_GLAD
+#include "imgui/backends/imgui_impl_opengl3.h"
 
-namespace {
-    Draw* g_app = nullptr;
-
-    constexpr int kTitlebarH = 54;
-    constexpr int kResizeBorder = 8;
-
-    constexpr int kCapBtnW = 38;
-    constexpr int kCapBtnH = 26;
-    constexpr int kCapGap = 6;
-    constexpr int kCapRightPad = 14;
-    constexpr int kCapTopPad = 14;
-    constexpr int kCapBtnCount = 2;
-} // namespace
-
-static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
-        return 1;
-
-    switch (msg) {
-    case WM_CREATE:
-        g_hwnd = hwnd;
-        UI::ApplyRoundedRegion(hwnd, 14);
-        return 0;
-
-    case WM_SIZE:
-        if (g_app && wParam != SIZE_MINIMIZED) {
-            const UINT w = static_cast<UINT>(LOWORD(lParam));
-            const UINT h = static_cast<UINT>(HIWORD(lParam));
-            g_app->OnResize(w, h);
-        }
-        return 0;
-
-    case WM_NCHITTEST: {
-        POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        ScreenToClient(hwnd, &pt);
-
-        RECT rc{};
-        GetClientRect(hwnd, &rc);
-
-        const bool left = pt.x < (rc.left + kResizeBorder);
-        const bool right = pt.x >= (rc.right - kResizeBorder);
-        const bool top = pt.y < (rc.top + kResizeBorder);
-        const bool bottom = pt.y >= (rc.bottom - kResizeBorder);
-
-        if (top && left) return HTTOPLEFT;
-        if (top && right) return HTTOPRIGHT;
-        if (bottom && left) return HTBOTTOMLEFT;
-        if (bottom && right) return HTBOTTOMRIGHT;
-
-        if (left) return HTLEFT;
-        if (right) return HTRIGHT;
-        if (top) return HTTOP;
-        if (bottom) return HTBOTTOM;
-
-        if (pt.y < kTitlebarH) {
-            // 1) Exclude the tab strip so ImGui can click it
-            constexpr int kTabLeft = 12;
-            constexpr int kTabTop = 10;
-            constexpr int kTabH = 34;
-            constexpr int kTabGap = 8;
-
-            constexpr int kTabHomeW = 92;
-            constexpr int kTabScriptW = 92;
-            constexpr int kTabCustW = 160;
-            constexpr int kTabSetW = 110;
-
-            const int tabAreaW =
-                kTabHomeW + kTabGap +
-                kTabScriptW + kTabGap +
-                kTabCustW + kTabGap +
-                kTabSetW;
-
-            const int tabRight = kTabLeft + tabAreaW;
-            const int tabBot = kTabTop + kTabH;
-
-            if (pt.x >= kTabLeft && pt.x < tabRight && pt.y >= kTabTop && pt.y < tabBot)
-                return HTCLIENT;
-
-            // 2) Exclude the window buttons (- / X)
-            const int btnAreaW = kCapBtnCount * kCapBtnW + (kCapBtnCount - 1) * kCapGap;
-            const int btnLeft = rc.right - kCapRightPad - btnAreaW;
-            const int btnRight = rc.right - kCapRightPad;
-            const int btnTop = kCapTopPad;
-            const int btnBot = kCapTopPad + kCapBtnH;
-
-            if (pt.x >= btnLeft && pt.x < btnRight && pt.y >= btnTop && pt.y < btnBot)
-                return HTCLIENT;
-
-            // 3) Everything else in the header can drag
-            return HTCAPTION;
-        }
-
-        return HTCLIENT;
-    }
-
-    case WM_KEYDOWN:
-        if (wParam == VK_F5 && g_app) {
-            g_app->OnF5();
-            return 0;
-        }
-        break;
-
-    case WM_DESTROY:
-        g_running = false;
-        PostQuitMessage(0);
-        return 0;
-    }
-
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
+static void glfw_error_callback(int error, const char* description)
+{
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "GLFW Error %d: %s\n", error, description);
+    OutputDebugStringA(buf);
 }
 
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
+static void ApplyRoundedWindowRegion(GLFWwindow* window, int radius)
+{
+    HWND hwnd = glfwGetWin32Window(window);
+    if (!hwnd) return;
+
+    int w = 0, h = 0;
+    glfwGetWindowSize(window, &w, &h);
+
+    HRGN rgn = CreateRoundRectRgn(
+        0, 0, w + 1, h + 1,
+        radius * 2, radius * 2
+    );
+
+    SetWindowRgn(hwnd, rgn, TRUE);
+}
+namespace {
+
+    inline double GetProcessCPU()
+    {
+        static ULONGLONG lastTime = 0;
+        static ULONGLONG lastProcTime = 0;
+        static HANDLE self = GetCurrentProcess();
+        static bool init = false;
+
+        FILETIME ftCreation, ftExit, ftKernel, ftUser;
+        GetProcessTimes(self, &ftCreation, &ftExit, &ftKernel, &ftUser);
+
+        ULONGLONG procTime =
+            ((ULONGLONG)ftKernel.dwLowDateTime | ((ULONGLONG)ftKernel.dwHighDateTime << 32)) +
+            ((ULONGLONG)ftUser.dwLowDateTime | ((ULONGLONG)ftUser.dwHighDateTime << 32));
+
+        ULONGLONG nowTime = GetTickCount64();
+
+        if (!init) {
+            init = true;
+            lastTime = nowTime;
+            lastProcTime = procTime;
+            return 0.0;
+        }
+
+        ULONGLONG timeDiff = nowTime - lastTime;
+        ULONGLONG procDiff = procTime - lastProcTime;
+
+        lastTime = nowTime;
+        lastProcTime = procTime;
+
+        if (timeDiff == 0)
+            return 0.0;
+
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+
+        return (double)procDiff / (double)timeDiff / si.dwNumberOfProcessors * 100.0;
+    }
+    inline double GetSystemCPU()
+    {
+        static PDH_HQUERY query = nullptr;
+        static PDH_HCOUNTER counter;
+        static bool init = false;
+
+        if (!init)
+        {
+            PdhOpenQuery(nullptr, 0, &query);
+            PdhAddEnglishCounterA(query, "\\Processor(_Total)\\% Processor Time", 0, &counter);
+            PdhCollectQueryData(query);
+            init = true;
+            return 0.0;
+        }
+
+        PdhCollectQueryData(query);
+
+        PDH_FMT_COUNTERVALUE value;
+        PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, nullptr, &value);
+
+        return value.doubleValue;
+    }
+    inline void GetRAM(size_t& workingSetMB, size_t& privateMB)
+    {
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
+
+        workingSetMB = pmc.WorkingSetSize / 1024 / 1024;
+        privateMB = pmc.PrivateUsage / 1024 / 1024;
+    }
+    inline void LogSystemTelemetry(const char* tag)
+    {
+        double procCPU = GetProcessCPU();
+        double sysCPU = GetSystemCPU();
+
+        size_t wsMB = 0, privMB = 0;
+        GetRAM(wsMB, privMB);
+
+        LOGI("[SYS:%s] ProcCPU=%.2f%% SysCPU=%.2f%% RAM_WS=%zuMB RAM_PRIV=%zuMB",
+            tag,
+            procCPU,
+            sysCPU,
+            wsMB,
+            privMB);
+    }
+
+}
+
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
+{
     Console::AllocateConsoleOnce();
+    Console::ToggleConsole();
     SetUnhandledExceptionFilter(Console::UnhandledExceptionLogger);
-    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+	LOGI("Nexus Ultimate starting...");
+    {
+        std::string keybindErr;
+        if (!LoadKeybindsFromJson(&keybindErr))
+            LOGW("Keybinds load: %s", keybindErr.c_str());
+    }
+    {
+        std::string uiErr;
+        if (!LoadUiSettingsFromJson(&uiErr))
+            LOGW("UI settings load: %s", uiErr.c_str());
+    }
+    glfwSetErrorCallback(glfw_error_callback);
+    if (!glfwInit())
+        return 1;
 
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const char* glsl_version = "#version 130";
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 
-    constexpr const wchar_t* kClassName = L"R6_ImGui_DX11";
+    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
 
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = kClassName;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    RegisterClassW(&wc);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
-    HWND hwnd = CreateWindowExW(
-        0,
-        kClassName,
-        L"",
-        WS_POPUP,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1100, 900,
-        nullptr, nullptr, hInst, nullptr);
+    const int kWinW = 920;
+    const int kWinH = 520;
 
-    if (!hwnd) return 1;
+    GLFWwindow* window = glfwCreateWindow(kWinW, kWinH, "Nexus Ultimate", nullptr, nullptr);
+    if (!window)
+    {
+        glfwTerminate();
+        return 1;
+    }
 
-    ShowWindow(hwnd, SW_SHOWDEFAULT);
-    UpdateWindow(hwnd);
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
 
-    Draw draw{};
-    g_app = &draw;
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+    {
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return 1;
+    }
 
-    if (!draw.Init(hwnd)) return 1;
+    ApplyRoundedWindowRegion(window, 14);
 
     IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
+    ImGuiContext* imguiMainCtx = ImGui::CreateContext();
+
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
-    UI::ApplyOrangeBlackTheme();
 
-    ImGuiIO& io = ImGui::GetIO();
-    if (ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\CascadiaMono.ttf", 18.0f)) {
-        io.FontDefault = font;
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init(glsl_version);
+
+    constexpr int kScriptCfgW = 920;
+    constexpr int kScriptCfgH = 620;
+    glfwDefaultWindowHints();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+
+    GLFWwindow* scriptCfgWindow = glfwCreateWindow(kScriptCfgW, kScriptCfgH, "Script configuration", nullptr, window);
+    if (!scriptCfgWindow)
+    {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext(imguiMainCtx);
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return 1;
     }
-    else if (ImFont* fallback = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf", 18.0f)) {
-        io.FontDefault = fallback;
-    }
 
-    ImGui_ImplWin32_Init(hwnd);
-    ImGui_ImplDX11_Init(draw.dx.device.Get(), draw.dx.ctx.Get());
+    ImGuiContext* imguiScriptCfgCtx = ImGui::CreateContext();
+    ImGui::SetCurrentContext(imguiScriptCfgCtx);
+    ImGuiIO& ioScriptCfg = ImGui::GetIO();
+    ioScriptCfg.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ioScriptCfg.IniFilename = nullptr;
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(scriptCfgWindow, true);
+    ImGui_ImplOpenGL3_Init(glsl_version);
+    ImGui::SetCurrentContext(imguiMainCtx);
 
-    draw.Reload();
+    bool open = true;
 
-    std::string err;
-    if (!LoadKeybindsFromJson(&err))
-        LOGW("LoadKeybindsFromJson failed: %s", err.c_str());
+    int lastW = kWinW, lastH = kWinH;
+    int lastCfgW = kScriptCfgW, lastCfgH = kScriptCfgH;
+    bool lastScriptCfgShown = false;
+    g_running = true;
+    std::thread worker(WorkerThread);
+    auto lastSysCheck = std::chrono::steady_clock::now();
+    while (!glfwWindowShouldClose(window))
+    {
+        glfwPollEvents();
 
-    draw.worker = std::thread(WorkerThread);
-
-    MSG msg{};
-    while (g_running) {
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) g_running = false;
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        int curW = 0, curH = 0;
+        glfwGetWindowSize(window, &curW, &curH);
+        if (curW != lastW || curH != lastH)
+        {
+            lastW = curW; lastH = curH;
+            ApplyRoundedWindowRegion(window, 14);
         }
-        if (!g_running) break;
 
-        ImGui_ImplDX11_NewFrame();
-        ImGui_ImplWin32_NewFrame();
+        if (g_scriptConfigWindowOpen)
+        {
+            int cw = 0, ch = 0;
+            glfwGetWindowSize(scriptCfgWindow, &cw, &ch);
+            if (cw != lastCfgW || ch != lastCfgH)
+            {
+                lastCfgW = cw; lastCfgH = ch;
+                ApplyRoundedWindowRegion(scriptCfgWindow, 14);
+            }
+            if (!lastScriptCfgShown)
+            {
+                glfwShowWindow(scriptCfgWindow);
+                glfwFocusWindow(scriptCfgWindow);
+                ApplyRoundedWindowRegion(scriptCfgWindow, 14);
+                lastScriptCfgShown = true;
+            }
+        }
+        else if (lastScriptCfgShown)
+        {
+            glfwHideWindow(scriptCfgWindow);
+            lastScriptCfgShown = false;
+        }
+
+        if (glfwWindowShouldClose(scriptCfgWindow))
+        {
+            glfwSetWindowShouldClose(scriptCfgWindow, GLFW_FALSE);
+            g_scriptConfigWindowOpen = false;
+        }
+
+        ImGui::SetCurrentContext(imguiMainCtx);
+        glfwMakeContextCurrent(window);
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        draw.TickUI();
-
+        if (open)
+            RenderNexusUltimate(window, &open);
         ImGui::Render();
 
-        const float clearColor[4] = { 0.08f, 0.08f, 0.08f, 1.0f };
-        draw.dx.BeginFrame(clearColor);
-        draw.dx.RenderImGuiDrawData();
-        draw.dx.EndFrame();
+        int display_w = 0, display_h = 0;
+        glfwGetFramebufferSize(window, &display_w, &display_h);
+        glViewport(0, 0, display_w, display_h);
+
+        glClearColor(0.f, 0.f, 0.f, 1.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
+
+        if (g_scriptConfigWindowOpen)
+        {
+            ImGui::SetCurrentContext(imguiScriptCfgCtx);
+            glfwMakeContextCurrent(scriptCfgWindow);
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+            ImGui::NewFrame();
+
+            NexusUiColors uiColors{};
+            Nexus_GetThemeUiColors(&uiColors);
+            RenderOperatorConfigWindow(scriptCfgWindow, &g_scriptConfigWindowOpen, &uiColors);
+
+            ImGui::Render();
+
+            int cfg_fb_w = 0, cfg_fb_h = 0;
+            glfwGetFramebufferSize(scriptCfgWindow, &cfg_fb_w, &cfg_fb_h);
+            glViewport(0, 0, cfg_fb_w, cfg_fb_h);
+            glClearColor(0.06f, 0.06f, 0.07f, 1.f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            glfwSwapBuffers(scriptCfgWindow);
+
+            ImGui::SetCurrentContext(imguiMainCtx);
+            glfwMakeContextCurrent(window);
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSysCheck).count();
+
+        if (ms >= 3000)
+        {
+            lastSysCheck = now;
+            LogSystemTelemetry("3s");
+        }
     }
+    g_running = false;
+    if (worker.joinable())
+        worker.join();
+    if (!SaveKeybindsToJson(nullptr))
+        LOGW("Keybinds save failed");
+    if (!SaveUiSettingsToJson(nullptr))
+        LOGW("UI settings save failed");
 
-    g_app = nullptr;
+    ImGui::SetCurrentContext(imguiScriptCfgCtx);
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext(imguiScriptCfgCtx);
 
-    draw.Shutdown();
+    ImGui::SetCurrentContext(imguiMainCtx);
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext(imguiMainCtx);
 
-    ImGui_ImplDX11_Shutdown();
-    ImGui_ImplWin32_Shutdown();
-    ImGui::DestroyContext();
-
-    CoUninitialize();
+    glfwDestroyWindow(scriptCfgWindow);
+    glfwDestroyWindow(window);
+    glfwTerminate();
     return 0;
 }

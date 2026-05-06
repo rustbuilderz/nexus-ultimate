@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <fstream>
 #include <iomanip>
 #include <ios>
 #include <iostream>
@@ -14,38 +15,19 @@
 #include <sstream>
 #include <string>
 
+#include <Windows.h>
+#include <gdiplus.h>
+
 namespace Console {
 
     enum class LogLevel { Trace, Info, Warn, Error, Fatal };
 
     inline std::mutex g_logMutex;
 
-    inline std::wstring Win32ErrorMessageW(DWORD err) {
-        wchar_t* buf = nullptr;
+    inline std::atomic<bool> g_consoleVisible{ false };
+    inline HWND g_consoleHwnd = nullptr;
 
-        const DWORD flags =
-            FORMAT_MESSAGE_ALLOCATE_BUFFER |
-            FORMAT_MESSAGE_FROM_SYSTEM |
-            FORMAT_MESSAGE_IGNORE_INSERTS;
-
-        const DWORD lang = MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT);
-
-        const DWORD n = FormatMessageW(
-            flags, nullptr, err, lang,
-            reinterpret_cast<LPWSTR>(&buf),
-            0, nullptr);
-
-        std::wstring msg = (n && buf) ? std::wstring(buf, buf + n) : L"(no message)";
-        if (buf) LocalFree(buf);
-
-        while (!msg.empty()) {
-            const wchar_t c = msg.back();
-            if (c != L'\r' && c != L'\n' && c != L' ' && c != L'\t') break;
-            msg.pop_back();
-        }
-
-        return msg;
-    }
+    inline std::ofstream g_logFile;
 
     inline std::string NowTimeString() {
         using namespace std::chrono;
@@ -61,6 +43,7 @@ namespace Console {
         std::ostringstream oss;
         oss << std::put_time(&tm, "%H:%M:%S")
             << '.' << std::setw(3) << std::setfill('0') << ms.count();
+
         return oss.str();
     }
 
@@ -86,18 +69,43 @@ namespace Console {
         return "\x1b[0m";
     }
 
+    inline void InitFileLogger() {
+        std::lock_guard<std::mutex> lk(g_logMutex);
+
+        if (!g_logFile.is_open()) {
+            g_logFile.open("log.txt", std::ios::out | std::ios::app);
+        }
+
+        if (g_logFile.is_open()) {
+            g_logFile << "\n===== LOG SESSION START: "
+                << NowTimeString()
+                << " =====\n";
+            g_logFile.flush();
+        }
+    }
+
     inline void LogV(LogLevel lv, const char* fmt, va_list ap) {
         char buf[4096]{};
         vsnprintf_s(buf, _TRUNCATE, fmt, ap);
 
+        const std::string time = NowTimeString();
+
+        std::ostringstream line;
+        line << '[' << time << "] "
+            << '[' << LevelTag(lv) << "] "
+            << buf;
+
         std::lock_guard<std::mutex> lk(g_logMutex);
 
         std::cout << LevelColor(lv)
-            << '[' << NowTimeString() << "] "
-            << '[' << LevelTag(lv) << "] "
-            << "\x1b[0m"
-            << buf << '\n';
+            << line.str()
+            << "\x1b[0m\n";
         std::cout.flush();
+
+        if (g_logFile.is_open()) {
+            g_logFile << line.str() << '\n';
+            g_logFile.flush();
+        }
     }
 
     inline void Log(LogLevel lv, const char* fmt, ...) {
@@ -105,6 +113,33 @@ namespace Console {
         va_start(ap, fmt);
         LogV(lv, fmt, ap);
         va_end(ap);
+    }
+
+    inline std::wstring Win32ErrorMessageW(DWORD err) {
+        wchar_t* buf = nullptr;
+
+        const DWORD flags =
+            FORMAT_MESSAGE_ALLOCATE_BUFFER |
+            FORMAT_MESSAGE_FROM_SYSTEM |
+            FORMAT_MESSAGE_IGNORE_INSERTS;
+
+        const DWORD lang = MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT);
+
+        const DWORD n = FormatMessageW(
+            flags, nullptr, err, lang,
+            reinterpret_cast<LPWSTR>(&buf),
+            0, nullptr);
+
+        std::wstring msg = (n && buf) ? std::wstring(buf, buf + n) : L"(no message)";
+        if (buf) LocalFree(buf);
+
+        while (!msg.empty()) {
+            wchar_t c = msg.back();
+            if (c != L'\r' && c != L'\n' && c != L' ' && c != L'\t') break;
+            msg.pop_back();
+        }
+
+        return msg;
     }
 
     inline bool EnableVirtualTerminal() {
@@ -127,26 +162,28 @@ namespace Console {
             AttachConsole(ATTACH_PARENT_PROCESS);
         }
 
-        FILE* fDummy = nullptr;
-        freopen_s(&fDummy, "CONOUT$", "w", stdout);
-        freopen_s(&fDummy, "CONOUT$", "w", stderr);
-        freopen_s(&fDummy, "CONIN$", "r", stdin);
+        FILE* f = nullptr;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+        freopen_s(&f, "CONOUT$", "w", stderr);
+        freopen_s(&f, "CONIN$", "r", stdin);
 
         std::ios::sync_with_stdio(true);
-        EnableVirtualTerminal();
 
-        SetConsoleTitleW(L"R6 Picker Debug Console");
+        EnableVirtualTerminal();
+        SetConsoleTitleW(L"Debug Console");
+
+        InitFileLogger();
 
         g_consoleHwnd = GetConsoleWindow();
         g_consoleVisible = (g_consoleHwnd != nullptr);
 
-        Log(LogLevel::Info, "Console ready. hwnd=%p", (void*)g_consoleHwnd);
+        Log(LogLevel::Info, "Console initialized. hwnd=%p", (void*)g_consoleHwnd);
     }
 
     inline void ToggleConsole() {
         if (!g_consoleHwnd) g_consoleHwnd = GetConsoleWindow();
         if (!g_consoleHwnd) {
-            Log(LogLevel::Warn, "ToggleConsole: no console window handle.");
+            Log(LogLevel::Warn, "ToggleConsole failed: no hwnd");
             return;
         }
 
@@ -160,31 +197,36 @@ namespace Console {
     }
 
     inline LONG WINAPI UnhandledExceptionLogger(EXCEPTION_POINTERS* ep) {
-        const DWORD code = (ep && ep->ExceptionRecord) ? ep->ExceptionRecord->ExceptionCode : 0;
-        void* addr = (ep && ep->ExceptionRecord) ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+        const DWORD code = ep ? ep->ExceptionRecord->ExceptionCode : 0;
+        void* addr = ep ? ep->ExceptionRecord->ExceptionAddress : nullptr;
 
-        Log(LogLevel::Fatal, "Unhandled exception: code=0x%08lX addr=%p",
+        Log(LogLevel::Fatal,
+            "Unhandled exception: code=0x%08lX addr=%p",
             (unsigned long)code, addr);
+
+        if (g_logFile.is_open()) {
+            g_logFile << "===== CRASH =====\n";
+            g_logFile.flush();
+        }
 
         return EXCEPTION_EXECUTE_HANDLER;
     }
 
-} // namespace Console
+}
 
-// Convenience macros (keep call sites unchanged if you already use LOGI/LOGW/etc.)
 #define LOGT(...) ::Console::Log(::Console::LogLevel::Trace, __VA_ARGS__)
 #define LOGI(...) ::Console::Log(::Console::LogLevel::Info,  __VA_ARGS__)
 #define LOGW(...) ::Console::Log(::Console::LogLevel::Warn,  __VA_ARGS__)
 #define LOGE(...) ::Console::Log(::Console::LogLevel::Error, __VA_ARGS__)
 #define LOGF(...) ::Console::Log(::Console::LogLevel::Fatal, __VA_ARGS__)
 
-// Win32 check helpers
 #define WIN_CHECK(expr) do { \
     if (!(expr)) { \
         const DWORD _e = GetLastError(); \
         const std::wstring _m = ::Console::Win32ErrorMessageW(_e); \
-        const std::string _m8(_m.begin(), _m.end()); \
-        LOGE("WIN_CHECK failed: %s (err=%lu: %s) at %s:%d", #expr, (unsigned long)_e, _m8.c_str(), __FILE__, __LINE__); \
+        std::string _m8(_m.begin(), _m.end()); \
+        LOGE("WIN_CHECK failed: %s err=%lu %s (%s:%d)", \
+            #expr, (unsigned long)_e, _m8.c_str(), __FILE__, __LINE__); \
     } \
 } while (0)
 
@@ -192,13 +234,13 @@ namespace Console {
     if (!(expr)) { \
         const DWORD _e = GetLastError(); \
         const std::wstring _m = ::Console::Win32ErrorMessageW(_e); \
-        const std::string _m8(_m.begin(), _m.end()); \
-        LOGE("WIN_CHECK failed: %s (err=%lu: %s) at %s:%d", #expr, (unsigned long)_e, _m8.c_str(), __FILE__, __LINE__); \
+        std::string _m8(_m.begin(), _m.end()); \
+        LOGE("WIN_CHECK failed: %s err=%lu %s (%s:%d)", \
+            #expr, (unsigned long)_e, _m8.c_str(), __FILE__, __LINE__); \
         return (ret); \
     } \
 } while (0)
 
-// GDI+ status check
 inline const char* GdiplusStatusStr(Gdiplus::Status s) {
     using namespace Gdiplus;
     switch (s) {
@@ -227,9 +269,10 @@ inline const char* GdiplusStatusStr(Gdiplus::Status s) {
     }
 }
 
-#define GDIP_CHECK_OK(statusExpr) do { \
-    const auto _s = (statusExpr); \
+#define GDIP_CHECK_OK(expr) do { \
+    const auto _s = (expr); \
     if (_s != Gdiplus::Ok) { \
-        LOGE("GDI+ failed: %s -> %s at %s:%d", #statusExpr, GdiplusStatusStr(_s), __FILE__, __LINE__); \
+        LOGE("GDI+ failed: %s -> %s (%s:%d)", \
+            #expr, GdiplusStatusStr(_s), __FILE__, __LINE__); \
     } \
 } while (0)
